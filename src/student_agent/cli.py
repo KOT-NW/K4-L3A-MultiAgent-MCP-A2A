@@ -28,36 +28,64 @@ async def _show_tools(root: Path) -> None:
 
 
 async def _run(root: Path) -> None:
+    import os
+
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
+    try:
+        concurrency = max(1, int(os.getenv("CONCURRENCY", "5")))
+    except ValueError:
+        concurrency = 5
     output_root = root / "outputs"
     trace_path = root / "traces" / "trace.jsonl"
     output_root.mkdir(parents=True, exist_ok=True)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
+
+    # Resume: keep valid existing outputs instead of wiping everything.
+    pending: list[str] = []
+    for case_id in case_set.case_ids:
+        target = output_root / f"{case_id}.json"
+        if target.is_file():
+            try:
+                existing = json.loads(target.read_text(encoding="utf-8"))
+                contracts.validate_output(existing, f"outputs/{case_id}.json")
+                if existing.get("case_id") == case_id:
+                    continue
+            except (OSError, UnicodeDecodeError, ValueError):
+                pass
+        pending.append(case_id)
+    if not (trace_path.is_file() and pending and len(pending) < len(case_set.case_ids)):
+        trace_path.unlink(missing_ok=True)
     trace = TraceWriter(trace_path, contracts)
+    print(f"cases: {len(case_set.case_ids)}, pending: {len(pending)}, workers: {concurrency}")
+
+    async def _solve_one(gateway, semaphore, case_id: str) -> None:  # noqa: ANN001, ANN202
+        async with semaphore:
+            case = case_set.cases[case_id]
+            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+            try:
+                output = await solve_case(case, gateway, trace)
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                target = output_root / f"{case_id}.json"
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                temporary.replace(target)
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+                print(f"done {case_id}")
+            except Exception as exc:  # noqa: BLE001 - log and continue; resume will retry
+                print(f"ERROR {case_id}: {exc}")
 
     async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
         discovered_tools = await gateway.list_tools()
         if not discovered_tools:
             raise RuntimeError("MCP Gateway returned no tools")
-        for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+        semaphore = asyncio.Semaphore(concurrency)
+        await asyncio.gather(*(_solve_one(gateway, semaphore, cid) for cid in pending))
 
 
 def parser() -> argparse.ArgumentParser:
