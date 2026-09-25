@@ -145,8 +145,13 @@ async def _call_with_retry(
     *,
     case_id: str,
     args: dict[str, str],
-    retries: int = 2,
+    retries: int = -1,
 ) -> dict[str, Any] | None:
+    if retries < 0:  # tunable via env to conserve audited MCP calls on refill runs
+        try:
+            retries = max(1, int(os.getenv("MCP_RETRIES", "2")))
+        except ValueError:
+            retries = 2
     last: Exception | None = None
     for _ in range(max(1, retries)):
         try:
